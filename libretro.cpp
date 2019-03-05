@@ -1,12 +1,12 @@
-#include	<stdarg.h>
+#include <stdarg.h>
 #include "mednafen/mednafen.h"
+#include "mednafen/mednafen-endian.h"
 #include "mednafen/mempatcher.h"
 #include "mednafen/git.h"
 #include "mednafen/general.h"
-#ifdef NEED_DEINTERLACER
-#include	"mednafen/video/Deinterlacer.h"
-#endif
-#include "libretro.h"
+#include "mednafen/md5.h"
+#include <libretro.h>
+#include <streams/file_stream.h>
 
 static MDFNGI *game;
 
@@ -23,6 +23,9 @@ static retro_input_state_t input_state_cb;
 static bool overscan;
 static double last_sound_rate;
 static MDFN_PixelFormat last_pixel_format;
+
+static unsigned rot_screen;
+static unsigned select_pressed_last_frame;
 
 static MDFN_Surface *surf;
 
@@ -120,12 +123,11 @@ CSystem::CSystem(const uint8 *filememory, int32 filesize)
 	mMikie(NULL),
 	mSusie(NULL)
 {
-	mFileType=HANDY_FILETYPE_LNX;
+	mFileType=HANDY_FILETYPE_ILLEGAL;
 
 	if(filesize < 11)
    {
       /* Lynx ROM image is too short. */
-      return;
    }
 
 	char clip[11];
@@ -135,10 +137,15 @@ CSystem::CSystem(const uint8 *filememory, int32 filesize)
 
 	if(!strcmp(&clip[6],"BS93")) mFileType=HANDY_FILETYPE_HOMEBREW;
 	else if(!strcmp(&clip[0],"LYNX")) mFileType=HANDY_FILETYPE_LNX;
+	else if(filesize==128*1024 || filesize==256*1024 || filesize==512*1024)
+	{
+		/* Invalid Cart (type). but 128/256/512k size -> set to RAW and try to load raw rom image */
+		mFileType=HANDY_FILETYPE_RAW;
+	}
 	else
 	{
-      /* File format is unknown to module. */
-      return;
+      /* File format is unknown to module. This will then
+       * just load the core into an "Insert Game" screen */
 	}
 
 	MDFNMP_Init(65536, 1);
@@ -153,24 +160,14 @@ CSystem::CSystem(const uint8 *filememory, int32 filesize)
 
 	switch(mFileType)
 	{
+		case HANDY_FILETYPE_RAW:
 		case HANDY_FILETYPE_LNX:
 			mCart = new CCart(filememory,filesize);
 			mRam = new CRam(0,0);
 			break;
 		case HANDY_FILETYPE_HOMEBREW:
-			{
-			 #if 0
-			 static uint8 dummy_cart[CCart::HEADER_RAW_SIZE + 65536] = 
-			 {
-				'L', 'Y', 'N', 'X', 0x00, 0x01, 0x00, 0x00,
-				0x01, 0x00,
-			 };
-			 mCart = new CCart(dummy_cart, sizeof(dummy_cart));
-			 #else
-			 mCart = new CCart(NULL, 0);
-			 #endif
-			 mRam = new CRam(filememory,filesize);
-			}
+			mCart = new CCart(NULL, 0);
+			mRam = new CRam(filememory,filesize);
 			break;
 		case HANDY_FILETYPE_SNAPSHOT:
 		case HANDY_FILETYPE_ILLEGAL:
@@ -252,21 +249,49 @@ extern MDFNGI EmulatedLynx;
 
 static bool TestMagic(const char *name, MDFNFILE *fp)
 {
- return(CCart::TestMagic(fp->data, fp->size));
+ uint8 data[std::max<unsigned>(CCart::HEADER_RAW_SIZE, CRam::HEADER_RAW_SIZE)];
+ uint64 rc;
+
+ rc = fp->size;
+
+ if(rc >= CCart::HEADER_RAW_SIZE && CCart::TestMagic(data, sizeof(data)))
+  return true;
+
+ if(rc >= CRam::HEADER_RAW_SIZE && CRam::TestMagic(data, sizeof(data)))
+  return true;
+
+ return false;
 }
 
-static int Load(const char *name, MDFNFILE *fp)
+static int Load(const uint8_t *data, size_t size)
 {
-   lynxie = new CSystem(GET_FDATA_PTR(fp), GET_FSIZE_PTR(fp));
+ lynxie = new CSystem(data, size);
 
- int rot = lynxie->CartGetRotate();
- if(rot == CART_ROTATE_LEFT) MDFNGameInfo->rotated = MDFN_ROTATE270;
- else if(rot == CART_ROTATE_RIGHT) MDFNGameInfo->rotated = MDFN_ROTATE90;
+ switch(lynxie->CartGetRotate())
+ {
+  case CART_ROTATE_LEFT:
+   MDFNGameInfo->rotated = MDFN_ROTATE270;
+   break;
 
- gAudioEnabled = 1;
+  case CART_ROTATE_RIGHT:
+   MDFNGameInfo->rotated = MDFN_ROTATE90;
+   break;
+ }
 
- MDFN_printf(_("ROM:       %dKiB\n"), (lynxie->mCart->InfoROMSize + 1023) / 1024);
- MDFN_printf(_("ROM CRC32: 0x%08x\n"), lynxie->mCart->CRC32());
+ if(lynxie->mRam->InfoRAMSize)
+ {
+  memcpy(MDFNGameInfo->MD5, lynxie->mRam->MD5, 16);
+  MDFN_printf(_("RAM:       %u bytes\n"), lynxie->mRam->InfoRAMSize);
+  MDFN_printf(_("CRC32:     0x%08x\n"), lynxie->mRam->CRC32());
+  MDFN_printf(_("RAM MD5:   0x%s\n"), md5_context::asciistr(MDFNGameInfo->MD5, 0).c_str());
+ }
+ else
+ {
+  memcpy(MDFNGameInfo->MD5, lynxie->mCart->MD5, 16);
+  MDFN_printf(_("ROM:       %dKiB\n"), (lynxie->mCart->InfoROMSize + 1023) / 1024);
+  MDFN_printf(_("CRC32:     0x%08x\n"), lynxie->mCart->CRC32());
+  MDFN_printf(_("ROM MD5:   0x%s\n"), md5_context::asciistr(MDFNGameInfo->MD5, 0).c_str());
+ }
 
  MDFNGameInfo->fps = (uint32)(59.8 * 65536 * 256);
 
@@ -373,6 +398,24 @@ static void SetInput(int port, const char *type, void *ptr)
  chee = (uint8 *)ptr;
 }
 
+static void TransformInput(void)
+{
+ if(MDFN_GetSettingB("lynx.rotateinput"))
+ {
+  static const unsigned bp[4] = { 4, 6, 5, 7 };
+  const unsigned offs = MDFNGameInfo->rotated;
+  uint16 butt_data = MDFN_de16lsb(chee);
+
+  butt_data = (butt_data & 0xFF0F) |
+	      (((butt_data >> bp[0]) & 1) << bp[(0 + offs) & 3]) |
+	      (((butt_data >> bp[1]) & 1) << bp[(1 + offs) & 3]) |
+	      (((butt_data >> bp[2]) & 1) << bp[(2 + offs) & 3]) |
+	      (((butt_data >> bp[3]) & 1) << bp[(3 + offs) & 3]);
+  //printf("%d, %04x\n", MDFNGameInfo->rotated, butt_data);
+  MDFN_en16lsb(chee, butt_data);
+ }
+}
+
 int StateAction(StateMem *sm, int load, int data_only)
 {
  SFORMAT SystemRegs[] =
@@ -388,10 +431,8 @@ int StateAction(StateMem *sm, int load, int data_only)
 	SFARRAYN(lynxie->GetRamPointer(), RAM_SIZE, "RAM"),
 	SFEND
  };
- std::vector <SSDescriptor> love;
 
- love.push_back(SSDescriptor(SystemRegs, "SYST"));
- MDFNSS_StateAction(sm, load, data_only, love);
+ MDFNSS_StateAction(sm, load, data_only, SystemRegs, "SYST", false);
 
  if(!lynxie->mSusie->StateAction(sm, load, data_only))
   return(0);
@@ -435,20 +476,13 @@ static MDFNSetting LynxSettings[] =
 static const InputDeviceInputInfoStruct IDII[] =
 {
  { "a", "A (outer)", 8, IDIT_BUTTON_CAN_RAPID, NULL },
-
  { "b", "B (inner)", 7, IDIT_BUTTON_CAN_RAPID, NULL },
-
  { "option_2", "Option 2 (lower)", 5, IDIT_BUTTON_CAN_RAPID, NULL },
-
  { "option_1", "Option 1 (upper)", 4, IDIT_BUTTON_CAN_RAPID, NULL },
 
-
  { "left", "LEFT ←", 	/*VIRTB_DPAD0_L,*/ 2, IDIT_BUTTON, "right",		{ "up", "right", "down" } },
-
  { "right", "RIGHT →", 	/*VIRTB_DPAD0_R,*/ 3, IDIT_BUTTON, "left", 		{ "down", "left", "up" } },
-
  { "up", "UP ↑", 	/*VIRTB_DPAD0_U,*/ 0, IDIT_BUTTON, "down",		{ "right", "down", "left" } },
-
  { "down", "DOWN ↓", 	/*VIRTB_DPAD0_D,*/ 1, IDIT_BUTTON, "up", 		{ "left", "up", "right" } },
 
  { "pause", "PAUSE", 6, IDIT_BUTTON, NULL },
@@ -505,17 +539,11 @@ MDFNGI EmulatedLynx =
  2,     // Number of output sound channels
 };
 
-
-#ifdef NEED_DEINTERLACER
-static bool PrevInterlaced;
-static Deinterlacer deint;
-#endif
-
 #define MEDNAFEN_CORE_NAME_MODULE "lynx"
-#define MEDNAFEN_CORE_NAME "Mednafen Lynx"
-#define MEDNAFEN_CORE_VERSION "v0.9.32"
+#define MEDNAFEN_CORE_NAME "Beetle Lynx"
+#define MEDNAFEN_CORE_VERSION "v0.9.47"
 #define MEDNAFEN_CORE_EXTENSIONS "lnx"
-#define MEDNAFEN_CORE_TIMING_FPS 75
+#define MEDNAFEN_CORE_TIMING_FPS 75.0
 #define MEDNAFEN_CORE_GEOMETRY_BASE_W 160
 #define MEDNAFEN_CORE_GEOMETRY_BASE_H 102
 #define MEDNAFEN_CORE_GEOMETRY_MAX_W 160
@@ -627,23 +655,29 @@ static void check_variables(void)
 
 #define MAX_PLAYERS 1
 #define MAX_BUTTONS 9
-static uint8_t input_buf[MAX_PLAYERS][2] = {{0}};
+static uint8_t input_buf[2];
 
-
-static void hookup_ports(bool force)
-{
-   if (initial_ports_hookup && !force)
-      return;
-
-   SetInput(0, "gamepad", &input_buf);
-
-   initial_ports_hookup = true;
-}
-
+static MDFNGI *MDFNI_LoadGame(const uint8_t *, size_t);
 bool retro_load_game(const struct retro_game_info *info)
 {
    if (!info || failed_init)
       return false;
+
+   struct retro_input_descriptor desc[] = {
+      { 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_LEFT,  "D-Pad Left" },
+      { 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_UP,    "D-Pad Up" },
+      { 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_DOWN,  "D-Pad Down" },
+      { 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_RIGHT, "D-Pad Right" },
+      { 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_B,     "A" },
+      { 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_A,     "B" },
+      { 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_L,     "Opt 1" },
+      { 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_R,     "Opt 2" },
+      { 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_START, "Option" },
+      { 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_SELECT, "Rotate Screen and D-Pad" },
+      { 0 },
+   };
+
+   environ_cb(RETRO_ENVIRONMENT_SET_INPUT_DESCRIPTORS, desc);
 
 #ifdef WANT_32BPP
    enum retro_pixel_format fmt = RETRO_PIXEL_FORMAT_XRGB8888;
@@ -658,9 +692,8 @@ bool retro_load_game(const struct retro_game_info *info)
    overscan = false;
    environ_cb(RETRO_ENVIRONMENT_GET_OVERSCAN, &overscan);
 
-   set_basename(info->path);
+   game = MDFNI_LoadGame((const uint8_t *)info->data, info->size);
 
-   game = MDFNI_LoadGame(MEDNAFEN_CORE_NAME_MODULE, info->path);
    if (!game)
       return false;
 
@@ -669,12 +702,10 @@ bool retro_load_game(const struct retro_game_info *info)
    
    surf = new MDFN_Surface(NULL, FB_WIDTH, FB_HEIGHT, FB_WIDTH, pix_fmt);
 
-#ifdef NEED_DEINTERLACER
-	PrevInterlaced = false;
-	deint.ClearState();
-#endif
+   SetInput(0, "gamepad", &input_buf);
 
-   hookup_ports(true);
+   rot_screen = 0;
+   select_pressed_last_frame = 0;
 
    check_variables();
 
@@ -689,34 +720,82 @@ void retro_unload_game()
    MDFNI_CloseGame();
 }
 
-
-
 // Hardcoded for PSX. No reason to parse lots of structures ...
 // See mednafen/psx/input/gamepad.cpp
 static void update_input(void)
 {
-   static unsigned map[] = {
-      RETRO_DEVICE_ID_JOYPAD_A,
-      RETRO_DEVICE_ID_JOYPAD_B,
-      RETRO_DEVICE_ID_JOYPAD_L,
-      RETRO_DEVICE_ID_JOYPAD_R,
-      RETRO_DEVICE_ID_JOYPAD_LEFT,
-      RETRO_DEVICE_ID_JOYPAD_RIGHT,
-      RETRO_DEVICE_ID_JOYPAD_UP,
-      RETRO_DEVICE_ID_JOYPAD_DOWN,
-      RETRO_DEVICE_ID_JOYPAD_START,
+   static unsigned map[4][9] = {
+      {
+         RETRO_DEVICE_ID_JOYPAD_A,
+         RETRO_DEVICE_ID_JOYPAD_B,
+         RETRO_DEVICE_ID_JOYPAD_L,
+         RETRO_DEVICE_ID_JOYPAD_R,
+         RETRO_DEVICE_ID_JOYPAD_LEFT,
+         RETRO_DEVICE_ID_JOYPAD_RIGHT,
+         RETRO_DEVICE_ID_JOYPAD_UP,
+         RETRO_DEVICE_ID_JOYPAD_DOWN,
+         RETRO_DEVICE_ID_JOYPAD_START
+      },
+      {
+         RETRO_DEVICE_ID_JOYPAD_A,
+         RETRO_DEVICE_ID_JOYPAD_B,
+         RETRO_DEVICE_ID_JOYPAD_L,
+         RETRO_DEVICE_ID_JOYPAD_R,
+         RETRO_DEVICE_ID_JOYPAD_DOWN,
+         RETRO_DEVICE_ID_JOYPAD_UP,
+         RETRO_DEVICE_ID_JOYPAD_LEFT,
+         RETRO_DEVICE_ID_JOYPAD_RIGHT,
+         RETRO_DEVICE_ID_JOYPAD_START
+      },
+      {
+         RETRO_DEVICE_ID_JOYPAD_A,
+         RETRO_DEVICE_ID_JOYPAD_B,
+         RETRO_DEVICE_ID_JOYPAD_L,
+         RETRO_DEVICE_ID_JOYPAD_R,
+         RETRO_DEVICE_ID_JOYPAD_RIGHT,
+         RETRO_DEVICE_ID_JOYPAD_LEFT,
+         RETRO_DEVICE_ID_JOYPAD_DOWN,
+         RETRO_DEVICE_ID_JOYPAD_UP,
+         RETRO_DEVICE_ID_JOYPAD_START
+      },
+      {
+         RETRO_DEVICE_ID_JOYPAD_A,
+         RETRO_DEVICE_ID_JOYPAD_B,
+         RETRO_DEVICE_ID_JOYPAD_L,
+         RETRO_DEVICE_ID_JOYPAD_R,
+         RETRO_DEVICE_ID_JOYPAD_UP,
+         RETRO_DEVICE_ID_JOYPAD_DOWN,
+         RETRO_DEVICE_ID_JOYPAD_RIGHT,
+         RETRO_DEVICE_ID_JOYPAD_LEFT,
+         RETRO_DEVICE_ID_JOYPAD_START
+      },
    };
 
-   for (unsigned j = 0; j < MAX_PLAYERS; j++)
-   {
-      uint16_t input_state = 0;
-      for (unsigned i = 0; i < MAX_BUTTONS; i++)
-         input_state |= input_state_cb(j, RETRO_DEVICE_JOYPAD, 0, map[i]) ? (1 << i) : 0;
 
-      // Input data must be little endian.
-      input_buf[j][0] = (input_state >> 0) & 0xff;
-      input_buf[j][1] = (input_state >> 8) & 0xff;
+   uint16_t input_state = 0;
+   for (unsigned i = 0; i < MAX_BUTTONS; i++)
+      input_state |= input_state_cb(0, RETRO_DEVICE_JOYPAD, 0, map[rot_screen][i]) ? (1 << i) : 0;
+
+   // Input data must be little endian.
+   input_buf[0] = (input_state >> 0) & 0xff;
+   input_buf[1] = (input_state >> 8) & 0xff;
+
+   unsigned select_button = input_state_cb(0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_SELECT);
+
+   if (select_button && !select_pressed_last_frame)
+   {
+      rot_screen++;
+      if (rot_screen > 3)
+         rot_screen = 0;
+
+      const float aspect[2] = { (80.0 / 51.0), (51.0 / 80.0) };
+      const unsigned rot_angle[4] = { 0, 1, 2, 3 };
+      struct retro_game_geometry new_geom = { FB_WIDTH, FB_HEIGHT, FB_WIDTH, FB_HEIGHT, aspect[rot_screen & 1] };
+      environ_cb(RETRO_ENVIRONMENT_SET_GEOMETRY, (void*)&new_geom);
+      environ_cb(RETRO_ENVIRONMENT_SET_ROTATION, (void*)&rot_angle[rot_screen]);
    }
+
+   select_pressed_last_frame = select_button;
 }
 
 static uint64_t video_frames, audio_frames;
@@ -759,23 +838,6 @@ void retro_run()
 
    Emulate(&spec);
 
-#ifdef NEED_DEINTERLACER
-   if (spec.InterlaceOn)
-   {
-      if (!PrevInterlaced)
-         deint.ClearState();
-
-      deint.Process(spec.surface, spec.DisplayRect, spec.LineWidths, spec.InterlaceField);
-
-      PrevInterlaced = true;
-
-      spec.InterlaceOn = false;
-      spec.InterlaceField = 0;
-   }
-   else
-      PrevInterlaced = false;
-#endif
-
    int16 *const SoundBuf = spec.SoundBuf + spec.SoundBufSizeALMS * 2;
    int32 SoundBufSize = spec.SoundBufSize - spec.SoundBufSizeALMS;
    const int32 SoundBufMaxSize = spec.SoundBufMaxSize - spec.SoundBufSizeALMS;
@@ -811,7 +873,7 @@ void retro_get_system_info(struct retro_system_info *info)
 #define GIT_VERSION ""
 #endif
    info->library_version  = MEDNAFEN_CORE_VERSION GIT_VERSION;
-   info->need_fullpath    = true;
+   info->need_fullpath    = false;
    info->valid_extensions = MEDNAFEN_CORE_EXTENSIONS;
    info->block_extract    = false;
 }
@@ -820,7 +882,7 @@ void retro_get_system_av_info(struct retro_system_av_info *info)
 {
    memset(info, 0, sizeof(*info));
    info->timing.fps            = MEDNAFEN_CORE_TIMING_FPS;
-   info->timing.sample_rate    = 44100;
+   info->timing.sample_rate    = 44100.0;
    info->geometry.base_width   = MEDNAFEN_CORE_GEOMETRY_BASE_W;
    info->geometry.base_height  = MEDNAFEN_CORE_GEOMETRY_BASE_H;
    info->geometry.max_width    = MEDNAFEN_CORE_GEOMETRY_MAX_W;
@@ -860,6 +922,13 @@ void retro_set_environment(retro_environment_t cb)
 {
    environ_cb = cb;
 
+   struct retro_vfs_interface_info vfs_iface_info = {
+      1,
+      NULL
+   };
+
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VFS_INTERFACE, &vfs_iface_info))
+      filestream_vfs_init(&vfs_iface_info);
 }
 
 void retro_set_audio_sample(retro_audio_sample_t cb)
@@ -1005,13 +1074,13 @@ std::string MDFN_MakeFName(MakeFName_Type type, int id1, const char *cd1)
 void MDFND_DispMessage(unsigned char *str)
 {
    if (log_cb)
-      log_cb(RETRO_LOG_INFO, "%s\n", str);
+      log_cb(RETRO_LOG_INFO, "%s", str);
 }
 
 void MDFND_Message(const char *str)
 {
    if (log_cb)
-      log_cb(RETRO_LOG_INFO, "%s\n", str);
+      log_cb(RETRO_LOG_INFO, "%s", str);
 }
 
 void MDFND_MidSync(const EmulateSpecStruct *)
@@ -1051,30 +1120,16 @@ void MDFN_ResetMessages(void)
  MDFND_DispMessage(NULL);
 }
 
-
-MDFNGI *MDFNI_LoadGame(const char *force_module, const char *name)
+static MDFNGI *MDFNI_LoadGame(const uint8_t *data, size_t size)
 {
-	std::vector<FileExtensionSpecStruct> valid_iae;
-   MDFNGameInfo = &EmulatedLynx;
-   MDFNFILE *GameFile = NULL;
+	if (!data || !size) {
+		MDFN_indent(2);
+		goto error;
+	}
 
-	MDFN_printf(_("Loading %s...\n"),name);
+	MDFNGameInfo = &EmulatedLynx;
 
 	MDFN_indent(1);
-
-	// Construct a NULL-delimited list of known file extensions for MDFN_fopen()
-   const FileExtensionSpecStruct *curexts = KnownExtensions;
-
-   while(curexts->extension && curexts->description)
-   {
-      valid_iae.push_back(*curexts);
-      curexts++;
-   }
-
-   GameFile = file_open(name);
-
-	if(!GameFile)
-      goto error;
 
 	MDFN_printf(_("Using module: lynx\n\n"));
 	MDFN_indent(1);
@@ -1086,8 +1141,8 @@ MDFNGI *MDFNI_LoadGame(const char *force_module, const char *name)
 	// End load per-game settings
 	//
 
-   if(Load(name, GameFile) <= 0)
-      goto error;
+	if(Load(data, size) <= 0)
+		goto error;
 
 	MDFN_LoadGameCheats(NULL);
 	MDFNMP_InstallReadPatches();
@@ -1099,8 +1154,6 @@ MDFNGI *MDFNI_LoadGame(const char *force_module, const char *name)
    return(MDFNGameInfo);
 
 error:
-   if (GameFile)
-      file_close(GameFile);
    MDFN_indent(-2);
    MDFNGameInfo = NULL;
    return NULL;
@@ -1187,7 +1240,7 @@ void MDFN_printf(const char *format, ...)
    free(format_temp);
 
    MDFND_Message(temp);
-   free(temp);
+   delete[] temp;
 
    va_end(ap);
 }
@@ -1203,7 +1256,7 @@ void MDFN_PrintError(const char *format, ...)
  temp = new char[4096];
  vsnprintf(temp, 4096, format, ap);
  MDFND_PrintError(temp);
- free(temp);
+ delete[] temp;
 
  va_end(ap);
 }
@@ -1219,7 +1272,7 @@ void MDFN_DebugPrintReal(const char *file, const int line, const char *format, .
  temp = new char[4096];
  vsnprintf(temp, 4096, format, ap);
  fprintf(stderr, "%s:%d  %s\n", file, line, temp);
- free(temp);
+ delete[] temp;
 
  va_end(ap);
 }

@@ -57,6 +57,7 @@
 #define HANDY_FILETYPE_HOMEBREW	1
 #define HANDY_FILETYPE_SNAPSHOT	2
 #define HANDY_FILETYPE_ILLEGAL	3
+#define HANDY_FILETYPE_RAW		4
 
 #define HANDY_SCREEN_WIDTH	160
 #define HANDY_SCREEN_HEIGHT	102
@@ -73,8 +74,6 @@
 	uint32	gSystemNMI=FALSE;
 	uint32	gSystemCPUSleep=FALSE;
 	uint32	gSystemHalt=FALSE;
-
-	uint32	gAudioEnabled=FALSE;
 #else
 	extern uint32	gSystemCycleCount;
 	extern uint32	gSuzieDoneTime;
@@ -84,8 +83,6 @@
 	extern uint32	gSystemNMI;
 	extern uint32	gSystemCPUSleep;
 	extern uint32	gSystemHalt;
-
-	extern uint32	gAudioEnabled;
 #endif
 
 //
